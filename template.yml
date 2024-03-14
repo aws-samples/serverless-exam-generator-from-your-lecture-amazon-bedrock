@@ -1,0 +1,938 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: |
+  This Template automates the creation of a an Exam Generation application using Amazon Bedrock
+  DISCLAIMER: This template includes sections that are initially commented out for testing purposes using HTTP. 
+  Users have the option to uncomment these sections to enable HTTP testing. Conversely, to ensure secure communication,
+  it is recommended to use HTTPS by default. If you choose to enable HTTP for testing, please remember to comment out 
+  the HTTPS related parts and variables if HTTPS is not needed. This adjustment allows for flexibility in testing environments, but always ensure 
+  secure configurations (HTTPS) are used in production environments for enhanced security.
+
+Parameters:
+  DefaultVPCID:
+    Type: String
+    Description: The VPC ID of the default VPC.
+  SubnetIdOne:
+    Type: String
+    Description: The ID of the first subnet in the default VPC.
+  SubnetIdTwo:
+    Type: String
+    Description: The ID of the second subnet in the default VPC.
+  genCertificateArn:
+    Type: String
+    Description: The ARN of the SSL certificate from ACM for HTTPS listener.
+  takeCertificateArn:
+    Type: String
+    Description: The ARN of the SSL certificate from ACM for HTTPS listener.
+  GenExamImageUri:
+    Type: String
+    Description: Docker image URI for the gen-exam container.
+  TakeExamImageUri:
+    Type: String
+    Description: Docker image URI for the take-exam container.
+  GenExamCallbackURL:
+    Type: String
+    Description: First callback URL for the Cognito Hosted UI.
+  TakeExamCallbackURL:
+    Type: String
+    Description: Second callback URL for the Cognito Hosted UI.
+  CPUArchitecture:
+    Type: String
+    AllowedValues:
+      - ARM64
+      - x86_64
+    Default: ARM64
+    Description: CPU Architecture for ECS Task Definitions.
+
+
+Resources:
+  # DynamoDB Table
+  QuizResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "QuizResults-${AWS::StackName}-${AWS::AccountId}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "email"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "email"
+          KeyType: "HASH"
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+
+  ExamGenDemoUsersCognitoPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'gen-exam-cognito-user-pool-${AWS::StackName}'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+          AttributeDataType: String
+
+  ExamGenDemoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'gen-exam-user-pool-client-${AWS::StackName}'
+      UserPoolId: !Ref ExamGenDemoUsersCognitoPool
+      AllowedOAuthFlowsUserPoolClient: true
+      GenerateSecret: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid]
+      CallbackURLs:
+        - !Sub 'https://${GenExamCallbackURL}/oauth2/idpresponse'
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  GenExamCognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      Identifier: !Sub 'cognito_resource_server-${AWS::StackName}'
+      Name: !Sub 'cognito_resource_server-${AWS::StackName}'
+      UserPoolId: !Ref ExamGenDemoUsersCognitoPool
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: GET
+        - ScopeName: write
+          ScopeDescription: POST
+
+  ExamGenDemoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'gen-exam-pool-domain-${AWS::AccountId}-${AWS::StackName}'
+      UserPoolId: !Ref ExamGenDemoUsersCognitoPool
+
+  CognitoConfigHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CognitoConfigHandlerPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action: 
+                  - "cognito-idp:UpdateUserPool"
+                Resource: "*"
+
+  CognitoConfigHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CognitoConfigHandlerRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event))
+              responseData = {}
+              try:
+                  cognito_client = boto3.client('cognito-idp')
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      cognito_client.update_user_pool(
+                          UserPoolId=event['ResourceProperties']['UserPoolId'],
+                          LambdaConfig={
+                              'PostConfirmation': event['ResourceProperties']['PostConfirmation'],
+                          },
+                          # Add email and SMS verification message customization here
+                          AutoVerifiedAttributes=['email'], # Assuming email verification is desired
+                          EmailVerificationMessage="Your verification code is {####}.",
+                          EmailVerificationSubject="Your verification code",
+                          # Uncomment the following lines if SMS verification is used
+                          # SmsVerificationMessage="Your verification code is {####}."
+                      )
+                      responseData = {'Status': 'Success'}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  elif event['RequestType'] == 'Delete':
+                      # Handle deletion event if necessary; often no action is needed.
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  print(f"Exception: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      Timeout: 120
+    
+  CognitoUserPoolLambdaConfig:
+    Type: "Custom::CognitoUserPoolLambdaConfig"
+    DependsOn: [CognitoPostSignupFn]
+    Properties:
+      ServiceToken: !GetAtt CognitoConfigHandlerLambda.Arn
+      UserPoolId: !Ref ExamGenDemoUsersCognitoPool
+      PostConfirmation: !GetAtt CognitoPostSignupFn.Arn
+
+  CognitoLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: [CognitoUserPoolLambdaConfig]
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CognitoPostSignupFn.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt ExamGenDemoUsersCognitoPool.Arn
+
+
+  TakeExamDemoUsersCognitoPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'take-exam-cognito-user-pool-${AWS::StackName}'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+          AttributeDataType: String
+
+  TakeExamDemoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'take-exam-user-pool-client-${AWS::StackName}'
+      UserPoolId: !Ref TakeExamDemoUsersCognitoPool
+      AllowedOAuthFlowsUserPoolClient: true
+      GenerateSecret: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid]
+      CallbackURLs:
+        - !Sub 'https://${TakeExamCallbackURL}/oauth2/idpresponse'
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  TakeExamCognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      Identifier: !Sub 'cognito_resource_server-${AWS::StackName}'
+      Name: !Sub 'cognito_resource_server-${AWS::StackName}'
+      UserPoolId: !Ref TakeExamDemoUsersCognitoPool
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: GET
+        - ScopeName: write
+          ScopeDescription: POST
+
+  TakeExamDemoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'take-exam-pool-domain-${AWS::AccountId}-${AWS::StackName}'
+      UserPoolId: !Ref TakeExamDemoUsersCognitoPool
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS traffic
+      VpcId: !Ref DefaultVPCID
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+
+  ECSServicesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ECS services to allow traffic only from ALB-${AWS::StackName}'
+      VpcId: !Ref DefaultVPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+
+
+  ExamGenTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref DefaultVPCID
+      Port: 8501
+      TargetType: ip
+      Protocol: HTTP
+      HealthCheckEnabled: true
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '5000'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+
+  TakeGenTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref DefaultVPCID
+      Port: 8501
+      TargetType: ip
+      Protocol: HTTP
+      HealthCheckEnabled: true
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '5000'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+
+  ExamGenALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'ExamGenALB-${AWS::StackName}'
+      Scheme: internet-facing
+      Subnets: 
+        - !Ref SubnetIdOne
+        - !Ref SubnetIdTwo
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ExamGenALBHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt ExamGenDemoUsersCognitoPool.Arn
+            UserPoolClientId: !Ref ExamGenDemoUserPoolClient
+            UserPoolDomain: !Ref ExamGenDemoUserPoolDomain
+            SessionCookieName: AWSELBAuthSessionCookie
+            SessionTimeout: 120
+            Scope: openid
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref ExamGenTG
+      LoadBalancerArn: !Ref ExamGenALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref genCertificateArn
+
+# un-comment if you need to test with HTTP traffic and no certifcate
+#  ExamGenALBHTTPListener:
+#    Type: AWS::ElasticLoadBalancingV2::Listener
+#    Properties:
+#      LoadBalancerArn: !Ref ExamGenALB
+#      Protocol: HTTP
+#      Port: 80
+#      DefaultActions:
+#        - Type: forward
+#          TargetGroupArn: !Ref ExamGenTG
+
+  TakeGenALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'TakeGenALB-${AWS::StackName}'
+      Scheme: internet-facing
+      Subnets: 
+        - !Ref SubnetIdOne
+        - !Ref SubnetIdTwo
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  TakeGenALBHTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt TakeExamDemoUsersCognitoPool.Arn
+            UserPoolClientId: !Ref TakeExamDemoUserPoolClient
+            UserPoolDomain: !Ref TakeExamDemoUserPoolDomain
+            SessionCookieName: AWSELBAuthSessionCookie
+            SessionTimeout: 120
+            Scope: openid
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TakeGenTG
+      LoadBalancerArn: !Ref TakeGenALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref takeCertificateArn
+# un-comment if you need to test with HTTP traffic and no certifcate
+#  TakeGenALBHTTPListener:
+#    Type: AWS::ElasticLoadBalancingV2::Listener
+#    Properties:
+#      LoadBalancerArn: !Ref TakeGenALB
+#      Protocol: HTTP
+#      Port: 80
+#      DefaultActions:
+#        - Type: forward
+#          TargetGroupArn: !Ref TakeGenTG
+
+  ExamGenSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-exam-gen-topic'
+
+  ExamGenLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'layers-${AWS::StackName}'
+      Description: required layers
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.9]
+    Metadata:
+      BuildMethod: python3.9
+
+  MyUniqueS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'exam-gen-demo-${AWS::AccountId}-${AWS::StackName}'
+
+  DynamoDBTriggerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: [ExamGenSnsTopic, QuizResultsTable]
+    Properties:
+      RoleName: !Sub 'DynamoDBTriggerLambdaExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaDynamoDBSNSCloudWatchPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action: "sns:Publish"
+                Resource: !Ref ExamGenSnsTopic 
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt QuizResultsTable.StreamArn
+
+  CognitoPostSignupFnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CognitoPostSignupFnExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CognitoPostSignupFnPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Subscribe
+                Resource: !Ref ExamGenSnsTopic 
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+  ExamGenLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ExamGenLambdaExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: 'lambda.amazonaws.com'}
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'GenExamLambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref ExamGenSnsTopic
+              - Effect: Allow
+                Action: 
+                  - 'bedrock:InvokeModel'
+                Resource: '*'
+ 
+  TakeExamLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: [MyUniqueS3Bucket]
+    Properties:
+      RoleName: !Sub 'TakeExamLambdaExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: 'lambda.amazonaws.com'}
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'TakeExamLambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action: 
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}'
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "questions_bank/*"
+              - Effect: Allow
+                Action: 
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}/questions_bank/*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt QuizResultsTable.Arn
+
+        
+  S3AccessPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: [ExamGenLambdaExecutionRole, MyUniqueS3Bucket]
+    Properties:
+      PolicyName: S3AccessPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 
+             - s3:ListBucket
+            Resource: !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}'
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - "exams/*"
+                  - "questions_bank/*"
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}/exams/*'
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}/questions_bank/*'
+      Roles:
+        - !Ref ExamGenLambdaExecutionRole
+
+  DynamoDBTriggerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: DynamoDBTriggerFn/
+      Timeout: 300
+      Handler:  score_card.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt DynamoDBTriggerLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ExamGenSnsTopic
+      Events:
+        DynamoDBEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt QuizResultsTable.StreamArn
+            StartingPosition: TRIM_HORIZON 
+            BatchSize: 100 
+            Enabled: true
+
+  CognitoPostSignupFn:
+    Type: AWS::Serverless::Function
+    DependsOn: [CognitoPostSignupFnExecutionRole]
+    Properties:
+      FunctionName: !Sub 'CognitoPostSignupFn-${AWS::StackName}'
+      Handler: cognito_post_signup.lambda_handler
+      Runtime: python3.9
+      CodeUri: cognito_post_signup_fn/
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ExamGenSnsTopic
+      Role: !GetAtt CognitoPostSignupFnExecutionRole.Arn
+
+  ExamGenFn:
+    Type: AWS::Serverless::Function
+    DependsOn: [ExamGenLambdaExecutionRole]
+    Properties:
+      FunctionName: !Sub 'ExamGenFn-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: main.main
+      CodeUri: ExamGenFn/
+      MemorySize: 10240
+      Timeout: 300
+      Layers:
+        - !Ref ExamGenLayer
+      Role: !GetAtt ExamGenLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ExamGenSnsTopic
+      Events:
+        S3ObjectCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref MyUniqueS3Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: exams/
+                  - Name: suffix
+                    Value: .pdf
+
+
+  TakeExamFn:
+    Type: AWS::Serverless::Function
+    DependsOn: [TakeExamLambdaExecutionRole]
+    Properties:
+      FunctionName: !Sub 'TakeExamFn-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: take_exam.lambda_handler
+      CodeUri: TakeExamFn/
+      MemorySize: 10240
+      Timeout: 300
+      Role: !GetAtt TakeExamLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref MyUniqueS3Bucket
+
+  ExamQuizApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'exam_quiz_apigw-${AWS::StackName}'
+      StageName: default
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: !Sub 'exam_quiz_apigw-${AWS::StackName}'
+          version: '2023-10-26T22:53:53Z'
+        paths:
+          /exam:
+            get:
+              responses:
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TakeExamFn.Arn}/invocations'
+
+  TakeExamFnApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt TakeExamFn.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExamQuizApi}/*/*/exam'
+
+  ECSFargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'ExamGeneratorCluster-${AWS::StackName}'
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ECSTaskExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ECSTaskExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+
+  ExamGenerationTaskRole:
+    Type: AWS::IAM::Role
+    DependsOn: [MyUniqueS3Bucket]
+    Properties:
+      RoleName: !Sub 'ExamGenerationTaskRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExamGenerationTaskPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                Resource: !Sub 'arn:aws:s3:::${MyUniqueS3Bucket}/exams/*'
+
+
+  TakeExamTaskRole:
+    Type: AWS::IAM::Role
+    DependsOn: [ExamQuizApi]
+    Properties:
+      RoleName: !Sub 'TakeExamTaskRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TakeExamTaskPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "execute-api:Invoke"
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExamQuizApi}/*/*/exam'
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:ListStreams"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                # Use the table ARN directly for DynamoDB actions, not the StreamArn
+                Resource: !GetAtt QuizResultsTable.Arn
+
+
+
+  GenExamTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: [ECSTaskExecutionRole, ExamGenerationTaskRole]
+    Properties:
+      Family: !Sub 'gen-exam-task-${AWS::StackName}'
+      Cpu: '1024'
+      Memory: '3072'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ExamGenerationTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: !Ref CPUArchitecture
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Sub 'gen-exam-container-${AWS::StackName}'
+          Image: !Ref GenExamImageUri
+          ReadonlyRootFilesystem: true
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: awslogs-create-group
+              Value: 'true'
+            - Name: awslogs-group
+              Value: !Sub 'exam-gen-demo-${AWS::StackName}'
+            - Name: awslogs-region
+              Value: !Ref AWS::Region
+            - Name: awslogs-stream-prefix
+              Value: !Sub 'exam-gen-${AWS::StackName}'
+            - Name: BUCKET_NAME
+              Value: !Ref MyUniqueS3Bucket
+          Cpu: 1024
+          Memory: 3072
+
+  TakeExamTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: [ECSTaskExecutionRole, TakeExamTaskRole]
+    Properties:
+      Family: !Sub 'take-exam-task-${AWS::StackName}'
+      Cpu: '1024'
+      Memory: '3072'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TakeExamTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Sub 'take-exam-container-${AWS::StackName}'
+          Image: !Ref TakeExamImageUri
+          ReadonlyRootFilesystem: true
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: API_GATEWAY_URL
+              Value: !Sub 'https://${ExamQuizApi}.execute-api.${AWS::Region}.amazonaws.com/default/exam'
+            - Name: DYNAMODB_TABLE_NAME
+              Value: !Ref QuizResultsTable
+            - Name: awslogs-create-group
+              Value: 'true'
+            - Name: awslogs-group
+              Value: !Sub 'exam-take-demo-${AWS::StackName}'
+            - Name: awslogs-region
+              Value: !Ref AWS::Region
+            - Name: awslogs-stream-prefix
+              Value: !Sub 'take-exam-${AWS::StackName}'
+          Cpu: 1024
+          Memory: 3072
+
+  TakeExamService:
+    Type: AWS::ECS::Service
+    DependsOn: [TakeGenALBHTTPSListener, TakeGenALB]
+    Properties:
+      ServiceName: !Sub 'take-exam-service-${AWS::StackName}'
+      Cluster: !Ref ECSFargateCluster
+      TaskDefinition: !Ref TakeExamTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetIdOne
+            - !Ref SubnetIdTwo
+          SecurityGroups:
+            - !GetAtt ECSServicesSecurityGroup.GroupId
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TakeGenTG
+          ContainerName: !Sub 'take-exam-container-${AWS::StackName}'
+          ContainerPort: 8501
+
+  GenExamService:
+    Type: AWS::ECS::Service
+    DependsOn: [ExamGenALBHTTPSListener, ExamGenALB]
+    Properties:
+      ServiceName: !Sub 'gen-exam-service-${AWS::StackName}'
+      Cluster: !Ref ECSFargateCluster
+      TaskDefinition: !Ref GenExamTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref SubnetIdOne
+            - !Ref SubnetIdTwo
+          SecurityGroups:
+            - !GetAtt ECSServicesSecurityGroup.GroupId
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref ExamGenTG
+          ContainerName: !Sub 'gen-exam-container-${AWS::StackName}'
+          ContainerPort: 8501
+
+Outputs:
+  ExamGenALBDNSName:
+    Description: "DNS Name of the Exam Generation ALB"
+    Value: !GetAtt ExamGenALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-ExamGenALBDNSName"
+
+  TakeGenALBDNSName:
+    Description: "DNS Name of the Take Exam ALB"
+    Value: !GetAtt TakeGenALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-TakeGenALBDNSName"
