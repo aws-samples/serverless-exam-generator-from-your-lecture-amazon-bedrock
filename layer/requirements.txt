@@ -1,7 +1,7 @@
 boto3==1.28.59
 langchain
 urllib3<2
-requests==2.29.0
+requests==2.32.0
 pdfminer.six
 cryptography
 charset-normalizer
