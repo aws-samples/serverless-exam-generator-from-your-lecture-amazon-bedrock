@@ -2,7 +2,7 @@ import json
 import os
 import sys
 import boto3
-from langchain.llms.bedrock import Bedrock
+from langchain_community.llms import Bedrock
 from langchain.prompts import PromptTemplate
 
 module_path = ".."
